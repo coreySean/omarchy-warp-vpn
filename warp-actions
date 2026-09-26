@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Backend for the coreySean.warp-vpn bar panel.
+#
+# Contract with the QML side: every subcommand prints a small block of
+# `key=value` lines on stdout. Outcomes are reported IN that block via
+# `ok=0|1` plus `error=...`, so a failing warp-cli still yields a readable
+# message instead of an empty stdout the panel cannot explain. Only a usage
+# mistake exits non-zero.
+#
+#   state=<Connected|Disconnected|Connecting|Unavailable>  connection state
+#   detail=<short human line>                             secondary status
+#   mode=<warp|warp+doh|...>                              operation mode
+#   ok=<0|1>                                              command succeeded
+#   error=<text>                                          present when ok=0
+
+# Deliberately NOT `set -e`: every command's exit status is inspected here so
+# a failure can be reported as data instead of aborting the script.
+set -uo pipefail
+
+WARP=(warp-cli --accept-tos)
+
+# Operation modes this build of warp-cli accepts, in the order the panel shows
+# them. `warp-cli mode` validates against the same list server-side; keeping a
+# local copy means an unknown mode can never be sent.
+MODES=(warp warp+doh warp+dot doh dot proxy tunnel_only)
+
+json() { "${WARP[@]}" --json "$@" 2>/dev/null; }
+
+# jq filter -> value, or the empty string when jq or warp-cli is unavailable.
+field() {
+  local filter="$1"
+  local raw
+  raw="$(json "${2:-}")" || raw=""
+  [[ -n $raw ]] || return 0
+  printf '%s' "$raw" | jq -r "$filter" 2>/dev/null | head -n 1
+}
+
+# Collapse a value to a single line so it can never break the key=value block.
+oneline() {
+  printf '%s' "${1-}" | tr '\n\r' '  ' | sed -e 's/[[:space:]]\{1,\}/ /g' -e 's/^ //' -e 's/ $//'
+}
+
+fail() {
+  printf 'ok=0\n'
+  printf 'error=%s\n' "$(oneline "${1:-warp-cli failed}")"
+}
+
+# `reason` is a plain string while things are fine and becomes a nested object
+# (e.g. {"SettingsChanged": ...}) on a transition, so flatten it to a label.
+reason_label() {
+  local raw
+  raw="$(json status)"
+  [[ -n $raw ]] || { printf 'Unavailable'; return 0; }
+  printf '%s' "$raw" | jq -r '
+    if (.reason | type) == "string" then .reason
+    elif (.reason | type) == "object" then (.reason | keys[0])
+    else "Unknown"
+    end' 2>/dev/null | head -n 1
+}
+
+# Human-facing form of a warp-cli reason token: "NetworkHealthy" reads better
+# as "Network healthy" in the panel's status line.
+pretty_reason() {
+  local token="$1"
+  [[ -n $token ]] || { printf 'Unknown'; return 0; }
+  printf '%s' "$token" \
+    | sed -E 's/([a-z0-9])([A-Z])/\1 \2/g; s/([A-Z]+)([A-Z][a-z])/\1 \2/g' \
+    | tr 'A-Z_' 'a-z  ' \
+    | sed -e 's/^ *//'
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  status)
+    if ! command -v warp-cli >/dev/null 2>&1; then
+      printf 'state=Unavailable\ndetail=warp-cli not installed\nok=0\nerror=warp-cli not found on PATH\n'
+      exit 0
+    fi
+
+    raw="$(json status)"
+    if [[ -z $raw ]]; then
+      printf 'state=Unavailable\ndetail=warp-svc not responding\nok=0\nerror=warp-cli status returned nothing\n'
+      exit 0
+    fi
+
+    state="$(printf '%s' "$raw" | jq -r '.status // "Unknown"' 2>/dev/null)"
+    [[ -n $state && $state != "null" ]] || state="Unknown"
+
+    mode="$(field '.settings.operation_mode' settings)"
+    [[ -n $mode && $mode != "null" ]] || mode="warp"
+    mode="$(printf '%s' "$mode" | tr 'A-Z' 'a-z')"
+
+    reason="$(reason_label)"
+    printf 'state=%s\n' "$state"
+    printf 'mode=%s\n' "$mode"
+    printf 'detail=%s\n' "$(pretty_reason "$reason")"
+    printf 'ok=1\n'
+    ;;
+
+  connect)
+    out="$("${WARP[@]}" connect 2>&1)"
+    if [[ $? -ne 0 ]]; then
+      fail "${out:-connect failed}"
+      exit 0
+    fi
+    printf 'ok=1\n'
+    ;;
+
+  disconnect)
+    out="$("${WARP[@]}" disconnect 2>&1)"
+    if [[ $? -ne 0 ]]; then
+      fail "${out:-disconnect failed}"
+      exit 0
+    fi
+    printf 'ok=1\n'
+    ;;
+
+  mode)
+    target="${2:-}"
+    valid=0
+    for m in "${MODES[@]}"; do
+      [[ $target == "$m" ]] && valid=1 && break
+    done
+    if [[ $valid -ne 1 ]]; then
+      fail "unsupported mode '${target:-}' (expected one of: ${MODES[*]})"
+      exit 0
+    fi
+    out="$("${WARP[@]}" mode "$target" 2>&1)"
+    if [[ $? -ne 0 ]] || grep -qi '^error' <<<"$out"; then
+      fail "${out:-mode change failed}"
+      exit 0
+    fi
+    printf 'ok=1\n'
+    ;;
+
+  modes)
+    printf '%s\n' "${MODES[@]}"
+    ;;
+
+  check)
+    command -v warp-cli >/dev/null 2>&1 && printf 'ok=1\n' || printf 'ok=0\n'
+    ;;
+
+  *)
+    echo "Usage: $0 {status|connect|disconnect|mode <id>|modes|check}" >&2
+    exit 2
+    ;;
+esac
