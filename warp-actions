@@ -139,64 +139,69 @@ case "$cmd" in
     # disconnect or mode switch -- flushing the cache alone leaves the link
     # entries stale.
     #
-    # Runs under pkexec, so the omarchy polkit agent puts a password prompt on
-    # screen and the whole refresh happens as one authenticated unit.
+    # Always runs under pkexec, once per click, so the refresh happens as one
+    # authenticated unit with the omarchy polkit agent putting the password
+    # prompt on screen. One is deliberate and not to be "improved": polkit
+    # re-prompts internally (a single authorisation allows several password
+    # entries), so a retry loop on top of that turns one click into a barrage
+    # of dialogs. There is no unprivileged fallback -- if pkexec cannot get a
+    # prompt, that is reported rather than papered over.
     #
-    # The program handed to `sh -c` is a fixed literal, never this file, and
-    # nothing is interpolated into it -- the link list is discovered inside the
-    # root shell. That matters: this plugin lives in a user-writable directory,
-    # so `pkexec "$0" ...` would hand root to anything able to write here. A
-    # static string over /bin/sh keeps the privileged surface to a DNS flush.
-    out="$(pkexec /bin/sh -c '
+    # The body is a fixed literal, never this file, and nothing is interpolated
+    # into it -- the link list is discovered inside the shell that runs it.
+    # That matters: this plugin lives in a user-writable directory, so
+    # `pkexec "$0" ...` would hand root to anything able to write here. A
+    # static string keeps the privileged surface down to a DNS flush.
+    DNS_REFRESH='
       did=0
       resolvectl flush-caches >/dev/null 2>&1 && did=1
       if command -v nmcli >/dev/null 2>&1; then
         nmcli general reload dns-full >/dev/null 2>&1 ||
           nmcli general reload conf >/dev/null 2>&1 || true
-        nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null |
-          while IFS=: read -r dev type state; do
-            [ "$state" = connected ] || continue
-            case "$type" in
-              wifi | 802-11-wireless | ethernet | 802-3-ethernet)
-                nmcli device reapply "$dev" >/dev/null 2>&1 || true
-                ;;
-            esac
-          done
-        did=1
+        for line in $(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null); do
+          dev=${line%%:*}
+          rest=${line#*:}
+          type=${rest%%:*}
+          state=${rest#*:}
+          [ "$state" = connected ] || continue
+          case "$type" in
+            wifi | 802-11-wireless | ethernet | 802-3-ethernet)
+              nmcli device reapply "$dev" >/dev/null 2>&1 && did=1
+              ;;
+          esac
+        done
       fi
       [ "$did" = 1 ] && echo flushed
-    ' 2>&1)"
+    '
+
+    # Streams kept apart: pkexec reports every failure on stderr, and folding
+    # that into stdout would both hide the real diagnostic and make the success
+    # token impossible to pick out.
+    err_file="$(mktemp)"
+    out="$(pkexec /bin/sh -c "$DNS_REFRESH" 2>"$err_file")"
     rc=$?
+    detail="$(oneline "$(cat "$err_file" 2>/dev/null)")"
+    rm -f "$err_file"
 
-    case "$rc" in
-      0) ;;
-      126)
-        fail "authentication cancelled"
-        exit 0
-        ;;
-      127)
-        fail "not authorised to flush DNS"
-        exit 0
-        ;;
-      *)
-        # A non-zero exit can still carry the success token if the helper got
-        # far enough to print it; don't echo that back as an error message.
-        if grep -q flushed <<<"$out"; then
-          fail "pkexec failed (exit $rc)"
-        else
-          fail "${out:-pkexec failed (exit $rc)}"
-        fi
-        exit 0
-        ;;
-    esac
-
-    # pkexec succeeds even when the helper printed nothing, so a silent run
-    # means nothing was there to flush.
-    if ! grep -q flushed <<<"$out"; then
-      fail "nothing to flush"
+    if [[ "$out" == *flushed* ]]; then
+      printf 'ok=1\nmethod=pkexec\n'
       exit 0
     fi
-    printf 'ok=1\n'
+
+    # Report what polkit actually said. 127 is not a single condition (see
+    # pkexec(1)) but "not authorized, or authorisation could not be obtained,
+    # or an error occurred", so guessing which one loses the detail.
+    case "$rc" in
+      0) why="nothing to flush" ;;
+      126) why="password prompt was dismissed" ;;
+      127) why="polkit would not authorise the flush" ;;
+      *) why="pkexec failed (exit $rc)" ;;
+    esac
+    if [[ -n "$detail" ]]; then
+      fail "$why: $detail"
+    else
+      fail "$why"
+    fi
     ;;
 
   modes)

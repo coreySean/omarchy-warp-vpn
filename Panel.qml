@@ -83,6 +83,8 @@ Panel {
   // actions. Clamped so a stray 0 cannot spin warp-cli.
   readonly property int pollIntervalMs: Math.max(2, Number(setting("pollIntervalSec", 4)) || 4) * 1000
 
+  // Opt-in password prompt for the DNS flush. Off by default; see flushDns().
+
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.4)
   readonly property color urgentColor: Color.urgent
@@ -147,8 +149,9 @@ Panel {
   function runAction(args, successMessage) {
     if (actionPending) return
     actionPending = true
-    actionStatus = ""
-    actionFailed = false
+    // The previous result is left in place until the new one lands. Blanking
+    // it here would make the text flicker, and the line's slot is reserved
+    // regardless, so there is no geometry benefit to clearing it.
     pendingSuccessMessage = successMessage || ""
     actionProcess.command = [root.scriptPath].concat(args)
     actionProcess.running = true
@@ -164,9 +167,9 @@ Panel {
       connected ? "Disconnected" : "Connecting…")
   }
 
-  // Drops the DNS cache and republishes NetworkManager's per-link DNS. The
-  // backend escalates through pkexec, so a password prompt is expected before
-  // anything happens.
+  // Drops the DNS cache and republishes NetworkManager's per-link DNS, so a
+  // tunnel change actually shows up in name resolution. Always one pkexec call
+  // per click, so a password prompt is expected before anything happens.
   function flushDns() {
     flushPending = true
     runAction(["flush-dns"], "DNS cache flushed")
@@ -364,15 +367,20 @@ Panel {
         }
 
         // Secondary line: what the backend reported, or why it is unavailable.
+        // Always laid out, never collapsed: KeyboardPanel centres the card on
+        // the bar icon, so a line appearing or disappearing would resize the
+        // panel and shove it around. Two lines of room, capped.
         Text {
-          textFormat: Text.PlainText
-          visible: root.detailText !== ""
           width: parent.width
+          height: Style.space(32)
+          textFormat: Text.PlainText
           text: root.detailText
           color: root.view.error !== "" ? root.urgentColor : root.dim
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.bodySmall
           wrapMode: Text.WordWrap
+          maximumLineCount: 2
+          elide: Text.ElideRight
         }
 
         PanelSeparator {
@@ -425,7 +433,6 @@ Panel {
 
         // Drops the resolved cache and republishes NetworkManager's per-link
         // DNS, which is what makes a tunnel change show up in name resolution.
-        // The backend escalates through pkexec, so this asks for a password.
         Button {
           id: flushButton
           width: parent.width
@@ -442,16 +449,20 @@ Panel {
           onClicked: root.flushDns()
         }
 
-        // Result of the last action: a confirmation, or why it failed.
+        // Result of the last action: a confirmation, or why it failed. Same
+        // reserved slot as the detail line above, so showing a result never
+        // resizes the panel.
         Text {
-          textFormat: Text.PlainText
-          visible: root.actionStatus !== ""
           width: parent.width
+          height: Style.space(32)
+          textFormat: Text.PlainText
           text: root.actionStatus
           color: root.actionFailed ? root.urgentColor : root.dim
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.caption
           wrapMode: Text.WordWrap
+          maximumLineCount: 2
+          elide: Text.ElideRight
         }
       }
     }

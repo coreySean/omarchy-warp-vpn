@@ -14,7 +14,7 @@ disconnect, and switch between WARP operation modes.
 - Connect / disconnect from a switch in the panel header
 - Switch between the seven operation modes `warp-cli` supports
 - Flush the DNS cache and republish NetworkManager's per-link DNS, so a
-  tunnel change actually shows up in name resolution (asks for your password)
+  tunnel change actually shows up in name resolution
 - Reports what `warp-cli` actually said, so a failure shows a reason instead
   of silently reading as "disconnected"
 - Polls for changes made outside the panel (a `warp-cli connect` in a
@@ -95,14 +95,23 @@ stale, so **Flush DNS cache** does three things:
 3. `nmcli device reapply` on each connected Wi-Fi/Ethernet link (loopback and
    P2P are skipped)
 
-It runs through `pkexec`, so the Omarchy polkit agent puts a **password prompt**
-on screen and the whole refresh happens as one authenticated unit. The button
-reads "Waiting for password…" until you answer.
+It always runs under `pkexec`, so the Omarchy polkit agent puts a **password
+prompt** on screen and the whole refresh happens as one authenticated unit. The
+button reads "Waiting for password…" until you answer.
 
-Note that on many systems — including a default Omarchy install — every one of
-those steps already succeeds unprivileged, so the prompt is not strictly
-required. It is there because doing the NetworkManager republish as root is
-reliable regardless of how polkit is configured.
+**Once per click, and that is deliberate.** polkit re-prompts internally — a
+single authorisation permits several password entries — so a retry loop on top
+of that turns one click into a barrage of dialogs. There is exactly one
+`pkexec` invocation in the code and no retry. If it cannot get a prompt, that
+is reported rather than quietly retried or worked around.
+
+Worth knowing when it does fail: `pkexec` exit `127` is deliberately vague. Per
+`pkexec(1)` it covers "not authorized" **and** "authorization could not be
+obtained" **and** "an error occurred", so it is not by itself evidence that a
+password was wrong. The widget quotes whatever polkit actually said rather than
+guessing which case it hit, so the panel shows the real reason. A common cause
+of a missing prompt is a stale polkit agent registration after a shell restart;
+`omarchy restart shell` re-registers it.
 
 ### Why the privileged surface is so narrow
 
