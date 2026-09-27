@@ -133,6 +133,72 @@ case "$cmd" in
     printf 'ok=1\n'
     ;;
 
+  flush-dns)
+    # Drops the resolved cache and republishes NetworkManager's per-link DNS,
+    # which is what actually propagates a DNS change after a WARP connect,
+    # disconnect or mode switch -- flushing the cache alone leaves the link
+    # entries stale.
+    #
+    # Runs under pkexec, so the omarchy polkit agent puts a password prompt on
+    # screen and the whole refresh happens as one authenticated unit.
+    #
+    # The program handed to `sh -c` is a fixed literal, never this file, and
+    # nothing is interpolated into it -- the link list is discovered inside the
+    # root shell. That matters: this plugin lives in a user-writable directory,
+    # so `pkexec "$0" ...` would hand root to anything able to write here. A
+    # static string over /bin/sh keeps the privileged surface to a DNS flush.
+    out="$(pkexec /bin/sh -c '
+      did=0
+      resolvectl flush-caches >/dev/null 2>&1 && did=1
+      if command -v nmcli >/dev/null 2>&1; then
+        nmcli general reload dns-full >/dev/null 2>&1 ||
+          nmcli general reload conf >/dev/null 2>&1 || true
+        nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null |
+          while IFS=: read -r dev type state; do
+            [ "$state" = connected ] || continue
+            case "$type" in
+              wifi | 802-11-wireless | ethernet | 802-3-ethernet)
+                nmcli device reapply "$dev" >/dev/null 2>&1 || true
+                ;;
+            esac
+          done
+        did=1
+      fi
+      [ "$did" = 1 ] && echo flushed
+    ' 2>&1)"
+    rc=$?
+
+    case "$rc" in
+      0) ;;
+      126)
+        fail "authentication cancelled"
+        exit 0
+        ;;
+      127)
+        fail "not authorised to flush DNS"
+        exit 0
+        ;;
+      *)
+        # A non-zero exit can still carry the success token if the helper got
+        # far enough to print it; don't echo that back as an error message.
+        if grep -q flushed <<<"$out"; then
+          fail "pkexec failed (exit $rc)"
+        else
+          fail "${out:-pkexec failed (exit $rc)}"
+        fi
+        exit 0
+        ;;
+    esac
+
+    # pkexec succeeds even when the helper printed nothing, so a silent run
+    # means nothing was there to flush.
+    if ! grep -q flushed <<<"$out"; then
+      fail "nothing to flush"
+      exit 0
+    fi
+    printf 'ok=1\n'
+    ;;
+
   modes)
     printf '%s\n' "${MODES[@]}"
     ;;
@@ -142,7 +208,7 @@ case "$cmd" in
     ;;
 
   *)
-    echo "Usage: $0 {status|connect|disconnect|mode <id>|modes|check}" >&2
+    echo "Usage: $0 {status|connect|disconnect|mode <id>|flush-dns|modes|check}" >&2
     exit 2
     ;;
 esac

@@ -96,11 +96,13 @@ function modeIndex(id) {
 // (JetBrainsMono Nerd Font, via `oct-`/`fa-` glyph names):
 //   U+F510 oct-shield_check   U+F468 oct-circle_slash
 //   U+F06A fa-exclamation_circle   U+F00C fa-check
+//   U+F00AA md-shield_refresh
 const ICON = {
   connected: "\u{F510}",   // shield with a check — traffic is tunnelled
   disconnected: "\u{F468}", // circle-slash — tunnel is down
   unavailable: "\u{F06A}",  // exclamation in a circle — warp-cli is gone
-  check: "\u{F00C}"         // marks the active mode row
+  check: "\u{F00C}",        // marks the active mode row
+  refresh: "\u{F00AA}"      // shield with a refresh arrow — the DNS flush
 };
 
 // Bar icon. The unavailable mark outranks everything: a panel that cannot

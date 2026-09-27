@@ -13,6 +13,8 @@ disconnect, and switch between WARP operation modes.
   connecting and mode selection live inside the panel
 - Connect / disconnect from a switch in the panel header
 - Switch between the seven operation modes `warp-cli` supports
+- Flush the DNS cache and republish NetworkManager's per-link DNS, so a
+  tunnel change actually shows up in name resolution (asks for your password)
 - Reports what `warp-cli` actually said, so a failure shows a reason instead
   of silently reading as "disconnected"
 - Polls for changes made outside the panel (a `warp-cli connect` in a
@@ -29,6 +31,7 @@ Inside the panel:
 | `j` / `k` or arrows | move cursor |
 | `enter` / `space` | activate the current row |
 | `c` | toggle the connection |
+| `f` | flush the DNS cache |
 | `tab` | switch to the next panel |
 | `esc` | close |
 
@@ -81,12 +84,45 @@ omarchy bar set coreySean.warp-vpn pollIntervalSec 10 --json
 Lower it for a snappier icon, raise it if you would rather `warp-cli` be
 called less often.
 
+## Flushing DNS
+
+Tunnelling changes which resolver answers, and NetworkManager keeps its own
+per-link view of that. Flushing the cache alone can leave those link entries
+stale, so **Flush DNS cache** does three things:
+
+1. `resolvectl flush-caches`
+2. `nmcli general reload dns-full`
+3. `nmcli device reapply` on each connected Wi-Fi/Ethernet link (loopback and
+   P2P are skipped)
+
+It runs through `pkexec`, so the Omarchy polkit agent puts a **password prompt**
+on screen and the whole refresh happens as one authenticated unit. The button
+reads "Waiting for password…" until you answer.
+
+Note that on many systems — including a default Omarchy install — every one of
+those steps already succeeds unprivileged, so the prompt is not strictly
+required. It is there because doing the NetworkManager republish as root is
+reliable regardless of how polkit is configured.
+
+### Why the privileged surface is so narrow
+
+Plugins live in `~/.config/omarchy/plugins/`, which is **user-writable**. So
+`pkexec` is never pointed at this repo's own files: that would hand root to
+anything able to write there. Instead the widget runs
+`pkexec /bin/sh -c '<a fixed literal>'`, with nothing interpolated into the
+string and the link list discovered *inside* the root shell. The only thing
+running as root is a DNS flush.
+
 ## Privacy
 
 The widget shells out to `warp-cli` and reads its output. It stores no
 credentials and reads none: WARP keeps your registration, account and device
 identity in the root-owned `/var/lib/cloudflare-warp`, and this plugin never
 touches it. Nothing about your account is sent anywhere by this code.
+
+The DNS flush asks for your password through polkit, the same prompt Omarchy
+already uses for its own privileged helpers. No password is stored, read or
+transmitted by this plugin.
 
 ## How it works
 

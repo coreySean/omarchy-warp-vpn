@@ -37,8 +37,10 @@ Panel {
   // Set while a connect/disconnect/mode change is in flight, so the poll does
   // not race the action and paint a stale state over the result.
   property bool actionPending: false
-  // Last line of backend output, shown when an action fails.
-  property string actionError: ""
+  // Result of the last action, shown under the panel: either a confirmation
+  // or the reason it failed. Empty until something runs.
+  property string actionStatus: ""
+  property bool actionFailed: false
 
   // Captured process output. StdioCollector.text is read-only, so the stream
   // hands the payload over here and the matching onExited reads it. With
@@ -48,6 +50,11 @@ Panel {
   property string statusErrorOutput: ""
   property string actionOutput: ""
   property string actionErrorOutput: ""
+  // Confirmation to show if the in-flight action succeeds; "" means stay quiet.
+  property string pendingSuccessMessage: ""
+  // True while the DNS flush is the action in flight, so its button can say it
+  // is waiting on the password prompt rather than looking stuck.
+  property bool flushPending: false
 
   readonly property var modes: Model.MODES
   readonly property bool connected: Model.isConnected(view.state)
@@ -84,25 +91,26 @@ Panel {
 
   // --- keyboard cursor ----------------------------------------------------
   // "header" is a virtual section for the hero toggle so the connection can be
-  // switched by keyboard even when no mode row is focused.
+  // switched by keyboard even when no mode row is focused. The order is
+  // header -> modes -> flush -> back to header.
   property string focusSection: "header"
   property int modeCursor: 0
   property bool cursorActive: false
   readonly property bool headerHasCursor: cursorActive && focusSection === "header"
 
-  function clampCursor() {
-    if (focusSection === "header") return
-    modeCursor = Math.max(0, Math.min(modeCursor, modes.length - 1))
-  }
-
   function moveCursor(delta) {
     if (delta > 0) {
       if (focusSection === "header") { focusSection = "modes"; modeCursor = 0; cursorActive = true; return }
-      if (modeCursor < modes.length - 1) { modeCursor += 1; return }
+      if (focusSection === "modes") {
+        if (modeCursor < modes.length - 1) { modeCursor += 1; return }
+        focusSection = "flush"
+        return
+      }
       focusSection = "header"
       return
     }
     if (focusSection === "header") { focusSection = "modes"; modeCursor = modes.length - 1; cursorActive = true; return }
+    if (focusSection === "flush") { focusSection = "modes"; modeCursor = modes.length - 1; return }
     if (modeCursor > 0) { modeCursor -= 1; return }
     focusSection = "header"
   }
@@ -112,9 +120,16 @@ Panel {
     focusSection = "header"
   }
 
+  function setFlushCursor() {
+    cursorActive = true
+    focusSection = "flush"
+  }
+
   function activateCursor() {
     if (!cursorActive) { cursorActive = true; return }
     if (focusSection === "header") { toggleConnection(); return }
+    if (focusSection === "flush") { flushDns(); return }
+
     setMode(modes[modeCursor].id)
   }
 
@@ -129,10 +144,12 @@ Panel {
     statusProcess.running = true
   }
 
-  function runAction(args) {
+  function runAction(args, successMessage) {
     if (actionPending) return
     actionPending = true
-    actionError = ""
+    actionStatus = ""
+    actionFailed = false
+    pendingSuccessMessage = successMessage || ""
     actionProcess.command = [root.scriptPath].concat(args)
     actionProcess.running = true
   }
@@ -143,7 +160,16 @@ Panel {
     // detached and the switch only moves once the poll catches up, so a
     // second click inside that window would re-read the old state and undo
     // the first.
-    runAction([connected ? "disconnect" : "connect"])
+    runAction([connected ? "disconnect" : "connect"],
+      connected ? "Disconnected" : "Connecting…")
+  }
+
+  // Drops the DNS cache and republishes NetworkManager's per-link DNS. The
+  // backend escalates through pkexec, so a password prompt is expected before
+  // anything happens.
+  function flushDns() {
+    flushPending = true
+    runAction(["flush-dns"], "DNS cache flushed")
   }
 
   function setMode(id) {
@@ -189,7 +215,10 @@ Panel {
       // A usage error exits non-zero with nothing on stdout; warp-cli being
       // missing is reported in-band with ok=0, so it arrives here normally.
       if (out.trim() === "") {
-        if (err !== "") root.actionError = err
+        if (err !== "") {
+          root.actionStatus = err
+          root.actionFailed = true
+        }
         return
       }
       root.view = Model.parseStatus(out)
@@ -212,14 +241,18 @@ Panel {
 
     onExited: function(exitCode) {
       root.actionPending = false
+      root.flushPending = false
       const out = root.actionOutput
       const err = root.actionErrorOutput.trim()
       const block = Model.parseBlock(out)
       if (block.ok === "0" || out.trim() === "") {
-        root.actionError = block.error || err || "warp-cli did not respond"
+        root.actionStatus = block.error || err || "the command did not respond"
+        root.actionFailed = true
       } else {
-        root.actionError = ""
+        root.actionStatus = root.pendingSuccessMessage
+        root.actionFailed = false
       }
+      root.pendingSuccessMessage = ""
       // Re-read after every action so the panel reflects what actually
       // happened rather than what was asked for.
       root.refresh()
@@ -270,6 +303,7 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "c" || t === "C") root.toggleConnection()
+        if (t === "f" || t === "F") root.flushDns()
       }
 
       Column {
@@ -378,13 +412,43 @@ Panel {
           }
         }
 
-        // Result of the last action, when it failed.
+        // ---------- DNS ----------
+        PanelSeparator {
+          foreground: root.foreground
+        }
+
+        PanelSectionHeader {
+          text: "DNS"
+          foreground: root.foreground
+          fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        }
+
+        // Drops the resolved cache and republishes NetworkManager's per-link
+        // DNS, which is what makes a tunnel change show up in name resolution.
+        // The backend escalates through pkexec, so this asks for a password.
+        Button {
+          id: flushButton
+          width: parent.width
+          text: root.actionPending && root.flushPending ? "Waiting for password…" : "Flush DNS cache"
+          iconText: root.actionPending && root.flushPending ? "" : Model.ICON.refresh
+          bordered: true
+          enabled: !root.actionPending
+          foreground: root.foreground
+          fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+          hasCursor: root.cursorActive && root.focusSection === "flush"
+          // Button renders its own tooltip from this, so no child is needed.
+          tooltipText: "Drops the DNS cache and republishes NetworkManager DNS. Asks for your password."
+          onHovered: function(on) { if (on) root.setFlushCursor() }
+          onClicked: root.flushDns()
+        }
+
+        // Result of the last action: a confirmation, or why it failed.
         Text {
           textFormat: Text.PlainText
-          visible: root.actionError !== ""
+          visible: root.actionStatus !== ""
           width: parent.width
-          text: root.actionError
-          color: root.urgentColor
+          text: root.actionStatus
+          color: root.actionFailed ? root.urgentColor : root.dim
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.caption
           wrapMode: Text.WordWrap
