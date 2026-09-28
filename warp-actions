@@ -204,6 +204,58 @@ case "$cmd" in
     fi
     ;;
 
+  net)
+    # Addresses shown at the bottom of the panel.
+    #
+    # Local addresses come from the kernel and cost nothing. The global one
+    # needs a network call, so it is kept separate in the panel and fetched
+    # only while the panel is open, and never more often than the configured
+    # interval -- not on the bar's status poll.
+    #
+    # Cloudflare's own trace endpoint is used rather than a third-party
+    # "what is my IP" site. While WARP is up the request already travels
+    # through Cloudflare, so this reveals nothing new. While WARP is down it
+    # does disclose the real egress IP to Cloudflare in the clear, which is
+    # why the lookup is separately switchable.
+    local4=""
+    local6=""
+    iface="$(ip route show default 2>/dev/null | awk '{print $5; exit}')"
+    if [[ -n "$iface" ]]; then
+      local4="$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk 'NR==1{print $4}' | cut -d/ -f1)"
+      # Skip fe80::/10: link-local is per-interface bookkeeping, not an address
+      # anything routes to, and showing it as "your IPv6" is just noise.
+      local6="$(ip -6 -o addr show dev "$iface" 2>/dev/null | awk '$4 !~ /^fe80:/ {print $4; exit}' | cut -d/ -f1)"
+    fi
+    [[ -n "$local4" ]] || local4="$(ip -4 -o addr show scope global 2>/dev/null | awk 'NR==1{print $4}' | cut -d/ -f1)"
+    [[ -n "$local6" ]] || local6="$(ip -6 -o addr show scope global 2>/dev/null | awk '$4 !~ /^fe80:/ {print $4; exit}' | cut -d/ -f1)"
+
+    printf 'local4=%s\n' "$local4"
+    printf 'local6=%s\n' "$local6"
+
+    if [[ "${2:-}" == "--no-global" ]]; then
+      printf 'ok=1\n'
+      exit 0
+    fi
+
+    # Two requests so both families are reported; each is a few hundred bytes
+    # and the panel only makes them while it is open.
+    trace4="$(curl -4 -fsS --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+    trace6="$(curl -6 -fsS --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+
+    field_of() { sed -n "s/^$2=//p" <<<"$1" | head -n 1; }
+
+    printf 'global4=%s\n' "$(field_of "$trace4" ip)"
+    printf 'global6=%s\n' "$(field_of "$trace6" ip)"
+    # `warp` is Cloudflare telling us whether it saw the request arrive over
+    # the tunnel, which is a far better answer to "is WARP actually doing
+    # anything" than the daemon's own self-report.
+    warp="$(field_of "$trace4" warp)"
+    [[ -n "$warp" ]] || warp="$(field_of "$trace6" warp)"
+    printf 'warpseen=%s\n' "$warp"
+    printf 'loc=%s\n' "$(field_of "$trace4" loc)"
+    printf 'ok=1\n'
+    ;;
+
   modes)
     printf '%s\n' "${MODES[@]}"
     ;;
@@ -213,7 +265,7 @@ case "$cmd" in
     ;;
 
   *)
-    echo "Usage: $0 {status|connect|disconnect|mode <id>|flush-dns|modes|check}" >&2
+    echo "Usage: $0 {status|connect|disconnect|mode <id>|flush-dns|net [--no-global]|modes|check}" >&2
     exit 2
     ;;
 esac

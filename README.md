@@ -15,6 +15,8 @@ disconnect, and switch between WARP operation modes.
 - Switch between the seven operation modes `warp-cli` supports
 - Flush the DNS cache and republish NetworkManager's per-link DNS, so a
   tunnel change actually shows up in name resolution
+- Shows your local and global IP address at the bottom, plus a badge reporting
+  whether Cloudflare saw the lookup arrive over the tunnel
 - Reports what `warp-cli` actually said, so a failure shows a reason instead
   of silently reading as "disconnected"
 - Polls for changes made outside the panel (a `warp-cli connect` in a
@@ -54,11 +56,12 @@ locally and never sends an unknown mode.
 
 - `warp-cli` on `PATH`, plus a running `warp-svc` — on Arch:
   `omarchy pkg aur add cloudflare-warp-minimal-bin`
-- `jq` (already an Omarchy dependency)
+- `jq` and `curl` (both already Omarchy dependencies)
 
-No `sudo` and no `pkexec` prompt: the widget drives `warp-cli` as your user,
-and the daemon does the privileged work. Connecting to a network and changing
-modes both work unprivileged.
+Connecting, disconnecting and changing mode need no privilege: the widget
+drives `warp-cli` as your user and the daemon does the privileged work. The
+DNS flush is the one exception — it runs under `pkexec` and asks for your
+password. See [Flushing DNS](#flushing-dns).
 
 ## Install
 
@@ -83,6 +86,45 @@ omarchy bar set coreySean.warp-vpn pollIntervalSec 10 --json
 
 Lower it for a snappier icon, raise it if you would rather `warp-cli` be
 called less often.
+
+Turn the global IP lookup off entirely, if you would rather not send the
+request at all:
+
+```bash
+omarchy bar set coreySean.warp-vpn showGlobalIp false --json
+```
+
+The local address and the tunnel status are unaffected. The badge disappears
+with it, since it is read from the same response.
+
+## IP addresses
+
+The bottom of the panel shows the address of the interface your traffic leaves
+by (`Local`) and the address the internet sees (`Global`), for both IPv4 and
+IPv6. Next to the section header is a badge saying what Cloudflare reported
+seeing for the lookup itself:
+
+- **WARP on** — the request that fetched your global address arrived over the
+  tunnel. This is measured at the far end rather than self-reported locally, so
+  it is actual evidence that traffic is being carried, and that the global
+  address you see genuinely is the tunnel's.
+- **WARP off** — it did not, so the global address is your real one.
+
+That badge is the fastest way to settle "is WARP actually doing anything",
+because the two addresses differ whenever the tunnel is up.
+
+The local address is read from the kernel and costs nothing. The global one
+needs a network request, so it is:
+
+- fetched **only while the panel is open**, never on the bar's status poll;
+- rate-limited to once per `ipRefreshSec`, and refetched after a connect,
+  disconnect or mode change, since that is when it actually moves;
+- run in its own process, so a slow lookup can never delay the tunnel status;
+- fetched from **Cloudflare's own trace endpoint**, not a third-party
+  "what is my IP" site. While WARP is up the request already travels through
+  Cloudflare, so it reveals nothing new. While WARP is down it does disclose
+  your real egress IP to Cloudflare in the clear — which is why the lookup is
+  separately switchable.
 
 ## Flushing DNS
 
@@ -132,6 +174,11 @@ touches it. Nothing about your account is sent anywhere by this code.
 The DNS flush asks for your password through polkit, the same prompt Omarchy
 already uses for its own privileged helpers. No password is stored, read or
 transmitted by this plugin.
+
+The optional global IP lookup contacts `www.cloudflare.com` only — see
+[IP addresses](#ip-addresses) for exactly when, and for why that is not a new
+disclosure while WARP is up. Turn it off with
+`omarchy bar set coreySean.warp-vpn showGlobalIp false --json`.
 
 ## How it works
 

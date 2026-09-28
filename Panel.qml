@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
@@ -50,6 +51,7 @@ Panel {
   property string statusErrorOutput: ""
   property string actionOutput: ""
   property string actionErrorOutput: ""
+  property string ipOutput: ""
   // Confirmation to show if the in-flight action succeeds; "" means stay quiet.
   property string pendingSuccessMessage: ""
   // True while the DNS flush is the action in flight, so its button can say it
@@ -83,6 +85,60 @@ Panel {
   // actions. Clamped so a stray 0 cannot spin warp-cli.
   readonly property int pollIntervalMs: Math.max(2, Number(setting("pollIntervalSec", 4)) || 4) * 1000
 
+  // --- addresses ----------------------------------------------------------
+  // The local address is free (kernel state). The global one needs a network
+  // call, so it lives in its own process, is fetched only while the panel is
+  // open, and is rate-limited by ipRefreshSec. The bar's status poll never
+  // touches it.
+  readonly property bool showGlobalIp: setting("showGlobalIp", true) === true
+  readonly property int ipRefreshSec: Math.max(30, Number(setting("ipRefreshSec", 60)) || 60)
+
+  property string local4: ""
+  property string local6: ""
+  property string global4: ""
+  property string global6: ""
+  // What Cloudflare reported seeing: "on" means the lookup itself arrived over
+  // the tunnel, which is independent confirmation WARP is carrying traffic.
+  property string warpSeen: ""
+  property string loc: ""
+  property double ipFetchedAt: 0
+
+  function ipIsStale() {
+    return (Date.now() - root.ipFetchedAt) > root.ipRefreshSec * 1000
+  }
+
+  function refreshIps(force) {
+    if (ipProcess.running) return
+    if (!force && !root.ipIsStale()) return
+    ipFetchedAt = Date.now()
+    ipProcess.command = [root.scriptPath, "net"].concat(root.showGlobalIp ? [] : ["--no-global"])
+    ipProcess.running = true
+  }
+
+  // Join the families that exist rather than printing a blank for the missing
+  // one — plenty of connections have no global IPv6 at all.
+  function localText() {
+    var parts = []
+    if (local4 !== "") parts.push(local4)
+    if (local6 !== "") parts.push(local6)
+    return parts.length > 0 ? parts.join("  ·  ") : "unavailable"
+  }
+
+  function globalText() {
+    if (!showGlobalIp) return "off"
+    var parts = []
+    if (global4 !== "") parts.push(global4)
+    if (global6 !== "") parts.push(global6)
+    return parts.length > 0 ? parts.join("  ·  ") : "…"
+  }
+
+  // Cloudflare's own verdict on whether it saw the request over the tunnel.
+  // Worth showing: it is measured at the far end, not self-reported locally.
+  function warpBadge() {
+    if (warpSeen === "") return ""
+    return warpSeen === "on" ? "WARP on" : "WARP off"
+  }
+
   // Opt-in password prompt for the DNS flush. Off by default; see flushDns().
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -99,6 +155,11 @@ Panel {
   property int modeCursor: 0
   property bool cursorActive: false
   readonly property bool headerHasCursor: cursorActive && focusSection === "header"
+
+  // Flat index of the focused mode, or -1 when the cursor is elsewhere. The
+  // mode list is a ListView, so this is what keeps the keyboard cursor in view.
+  readonly property int scrollModeIndex:
+    (cursorActive && focusSection === "modes") ? modeCursor : -1
 
   function moveCursor(delta) {
     if (delta > 0) {
@@ -182,7 +243,13 @@ Panel {
 
   // --- lifecycle ----------------------------------------------------------
 
-  onOpenedChanged: if (opened) refresh()
+  onOpenedChanged: {
+    if (opened) {
+      refresh()
+      // Addresses are only worth fetching while someone is looking at them.
+      refreshIps(true)
+    }
+  }
 
   Component.onCompleted: refresh()
 
@@ -257,8 +324,37 @@ Panel {
       }
       root.pendingSuccessMessage = ""
       // Re-read after every action so the panel reflects what actually
-      // happened rather than what was asked for.
+      // happened rather than what was asked for. The addresses are refetched
+      // too, since connecting or changing mode is exactly when the egress
+      // address moves.
       root.refresh()
+      root.refreshIps(true)
+    }
+  }
+
+  // Deliberately separate from statusProcess: the global lookup is a network
+  // round-trip and must never be able to delay or stall the tunnel status.
+  Process {
+    id: ipProcess
+    running: false
+    command: []
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.ipOutput = String(text || "")
+    }
+
+    onExited: function(exitCode) {
+      const out = root.ipOutput
+      if (out.trim() === "") return
+      const b = Model.parseBlock(out)
+      if (b.ok === "0") return
+      root.local4 = b.local4 || ""
+      root.local6 = b.local6 || ""
+      root.global4 = b.global4 || ""
+      root.global6 = b.global6 || ""
+      root.warpSeen = b.warpseen || ""
+      root.loc = b.loc || ""
     }
   }
 
@@ -394,29 +490,47 @@ Panel {
           fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         }
 
-        Column {
+        // ListView, not a Repeater in a Column: the mode list is the only part
+        // of the panel that grows, and seven two-line rows plus the hero, the
+        // DNS section and the address block is taller than a 1080p screen
+        // leaves room for. Capping it here keeps every control reachable on a
+        // short display instead of letting the card clip off the bottom.
+        ListView {
+          id: modeList
           width: parent.width
+          height: Math.min(contentHeight, Style.space(165))
           spacing: Style.space(2)
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          interactive: contentHeight > height
 
-          Repeater {
-            model: root.modes
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-            ModeRow {
-              required property var modelData
-              required property int index
+          model: root.modes
+          currentIndex: root.scrollModeIndex
+          // Deferred by a turn: the model is rebuilt whenever a mode is
+          // selected, and swapping it under a direct call resets the view out
+          // from under the scroll.
+          onCurrentIndexChanged: if (currentIndex >= 0) Qt.callLater(keepCurrentVisible)
+          function keepCurrentVisible() {
+            if (currentIndex >= 0) positionViewAtIndex(currentIndex, ListView.Contain)
+          }
 
-              width: parent.width
-              label: modelData.label
-              description: modelData.description
-              selected: modelData.id === root.view.mode
-              rowSelected: root.cursorActive && root.focusSection === "modes" && root.modeCursor === index
-              onHovered: function() {
-                root.cursorActive = true
-                root.focusSection = "modes"
-                root.modeCursor = index
-              }
-              onChosen: root.setMode(modelData.id)
+          delegate: ModeRow {
+            required property var modelData
+            required property int index
+
+            width: ListView.view.width
+            label: modelData.label
+            description: modelData.description
+            selected: modelData.id === root.view.mode
+            rowSelected: root.cursorActive && root.focusSection === "modes" && root.modeCursor === index
+            onHovered: function() {
+              root.cursorActive = true
+              root.focusSection = "modes"
+              root.modeCursor = index
             }
+            onChosen: root.setMode(modelData.id)
           }
         }
 
@@ -464,7 +578,114 @@ Panel {
           maximumLineCount: 2
           elide: Text.ElideRight
         }
+
+        // ---------- Addresses ----------
+        PanelSeparator {
+          foreground: root.foreground
+        }
+
+        // The badge rides the section header rather than a row, so the address
+        // itself gets the full width -- two families plus a badge will not fit
+        // on one line otherwise.
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(addressHeader.implicitHeight, warpBadge.implicitHeight)
+
+          PanelSectionHeader {
+            id: addressHeader
+            anchors.left: parent.left
+            anchors.bottom: parent.bottom
+            text: "IP ADDRESS"
+            foreground: root.foreground
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+          }
+
+          // Cloudflare's own view of whether the lookup arrived over the
+          // tunnel. Measured at the far end, so it is evidence rather than a
+          // self-report -- and it is what makes a "same IP" doubt answerable
+          // at a glance.
+          BorderSurface {
+            id: warpBadge
+            visible: root.warpBadge() !== ""
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            implicitWidth: warpBadgeText.implicitWidth + Style.space(10)
+            implicitHeight: warpBadgeText.implicitHeight + Style.space(4)
+            color: "transparent"
+            borderSpec: Border.controlSpec("normal", root.foreground,
+              root.warpSeen === "off" ? Color.urgent : Color.accent)
+            radius: Style.cornerRadius
+
+            Text {
+              id: warpBadgeText
+              textFormat: Text.PlainText
+              anchors.centerIn: parent
+              text: root.warpBadge()
+              color: root.warpSeen === "off" ? Color.urgent : root.foreground
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+        }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(4)
+
+          AddressRow {
+            width: parent.width
+            label: "Local"
+            value: root.localText()
+          }
+
+          AddressRow {
+            width: parent.width
+            label: "Global"
+            value: root.globalText()
+          }
+        }
       }
+    }
+  }
+
+  // One label/value line in the address block. Plain, non-interactive rows —
+  // nothing here is clickable, so no cursor ring is drawn. The value takes all
+  // the width the label leaves, since two address families rarely fit beside
+  // anything else.
+  component AddressRow: Item {
+    id: addressRow
+
+    property string label: ""
+    property string value: ""
+
+    width: parent ? parent.width : implicitWidth
+    implicitHeight: Math.max(labelText.implicitHeight, valueText.implicitHeight)
+
+    Text {
+      id: labelText
+      textFormat: Text.PlainText
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      text: addressRow.label
+      color: root.dim
+      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
+    Text {
+      id: valueText
+      textFormat: Text.PlainText
+      anchors.left: labelText.right
+      anchors.leftMargin: Style.space(12)
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      text: addressRow.value
+      color: root.foreground
+      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+      font.pixelSize: Style.font.body
+      elide: Text.ElideRight
+      width: Math.max(0, parent.width - x)
     }
   }
 

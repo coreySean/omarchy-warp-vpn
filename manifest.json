@@ -19,7 +19,9 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "pollIntervalSec": 4
+      "pollIntervalSec": 4,
+      "showGlobalIp": true,
+      "ipRefreshSec": 60
     },
     "schema": [
       {
@@ -30,6 +32,21 @@
         "max": 300,
         "step": 1,
         "defaultValue": 4
+      },
+      {
+        "key": "showGlobalIp",
+        "type": "boolean",
+        "label": "Look up the global IP address",
+        "defaultValue": true
+      },
+      {
+        "key": "ipRefreshSec",
+        "type": "integer",
+        "label": "Global IP refresh interval (seconds)",
+        "min": 30,
+        "max": 1800,
+        "step": 30,
+        "defaultValue": 60
       }
     ]
   }
